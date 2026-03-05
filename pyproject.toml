@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "StrataCache Contributors" }]
-dependencies = []
+dependencies = [
+    "PyYAML>=6.0",
+    "vllm==0.13.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -18,3 +21,5 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"stratacache" = ["config.yaml"]

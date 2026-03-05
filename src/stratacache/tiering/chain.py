@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 from stratacache.backend.base import MemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta
@@ -35,6 +35,11 @@ class TierChain:
         if len(links) != max(0, len(tiers) - 1):
             raise ValueError("links must have len(tiers)-1 items")
         self._tiers = list(tiers)
+        self._tier_name_to_idx: dict[str, int] = {}
+        for i, tier in enumerate(self._tiers):
+            if tier.name in self._tier_name_to_idx:
+                raise ValueError(f"duplicate tier name: {tier.name}")
+            self._tier_name_to_idx[tier.name] = i
         self._links = list(links)
         self._lock = threading.RLock()
         self._wb = WritebackManager(
@@ -51,8 +56,21 @@ class TierChain:
     def links(self) -> list[LinkPolicy]:
         return list(self._links)
 
+    @property
+    def tier_names(self) -> list[str]:
+        return [tier.name for tier in self._tiers]
+
     def close(self) -> None:
         self._wb.stop()
+
+    def _resolve_tier_index(self, tier: int | str) -> int:
+        if isinstance(tier, int):
+            idx = int(tier)
+        else:
+            idx = self._tier_name_to_idx.get(str(tier), -1)
+        if idx < 0 or idx >= len(self._tiers):
+            raise ValueError(f"unknown tier: {tier}")
+        return idx
 
     def exists(self, artifact_id: ArtifactId) -> Optional[int]:
         """
@@ -70,6 +88,11 @@ class TierChain:
                     # Backends should not throw, but keep exists() best-effort.
                     continue
         return None
+
+    def exists_in(self, tier: int | str, artifact_id: ArtifactId) -> bool:
+        idx = self._resolve_tier_index(tier)
+        with self._lock:
+            return self._tiers[idx].exists(artifact_id)
 
     def fetch(self, artifact_id: ArtifactId, *, promote: bool = True) -> FetchResult:
         """
@@ -91,6 +114,15 @@ class TierChain:
                 return FetchResult(payload=payload, meta=meta, hit_tier=i)
         raise ArtifactNotFound(str(artifact_id))
 
+    def fetch_from(self, tier: int | str, artifact_id: ArtifactId, *, promote: bool = False) -> FetchResult:
+        idx = self._resolve_tier_index(tier)
+        with self._lock:
+            payload, meta = self._tiers[idx].get(artifact_id)
+            if promote and idx > 0:
+                for up in range(0, idx):
+                    self._put_direct(up, artifact_id, payload, meta, reason=StoreReason.PROMOTION)
+            return FetchResult(payload=payload, meta=meta, hit_tier=idx)
+
     def store(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> None:
         """
         Store into the head tier and apply link semantics down the chain.
@@ -99,6 +131,27 @@ class TierChain:
             self._put_direct(0, artifact_id, payload, meta, reason=StoreReason.CLIENT_WRITE)
             self._propagate_after_write(0, artifact_id, payload, meta, reason=StoreReason.CLIENT_WRITE)
 
+    def store_at(
+        self,
+        tier: int | str,
+        artifact_id: ArtifactId,
+        payload: bytes,
+        meta: ArtifactMeta,
+        *,
+        propagate: bool = False,
+    ) -> None:
+        idx = self._resolve_tier_index(tier)
+        with self._lock:
+            self._put_direct(idx, artifact_id, payload, meta, reason=StoreReason.CLIENT_WRITE)
+            if propagate:
+                self._propagate_after_write(
+                    idx,
+                    artifact_id,
+                    payload,
+                    meta,
+                    reason=StoreReason.CLIENT_WRITE,
+                )
+
     def delete(self, artifact_id: ArtifactId) -> None:
         with self._lock:
             for b in self._tiers:
@@ -106,6 +159,16 @@ class TierChain:
             # Clear dirty markers for all possible upper tiers.
             for upper in range(len(self._links)):
                 self._wb.clear_dirty(upper, artifact_id)
+
+    def delete_from(self, tier: int | str, artifact_id: ArtifactId) -> None:
+        idx = self._resolve_tier_index(tier)
+        with self._lock:
+            self._tiers[idx].delete(artifact_id)
+            upper = idx
+            if upper < len(self._links):
+                self._wb.clear_dirty(upper, artifact_id)
+            if upper > 0:
+                self._wb.clear_dirty(upper - 1, artifact_id)
 
     def flush(self, artifact_id: Optional[ArtifactId] = None, *, max_items: Optional[int] = None) -> int:
         """
@@ -199,4 +262,3 @@ class TierChain:
             self._propagate_after_write(
                 lower, artifact_id, payload, meta, reason=StoreReason.WRITEBACK_FLUSH
             )
-

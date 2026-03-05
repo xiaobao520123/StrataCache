@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 class ArtifactType(str, Enum):
     KV_BLOCKS = "kv_blocks"
+    PARAM_CHUNK = "param_chunk"
+    OPTIMIZER_CHUNK = "optimizer_chunk"
     TENSOR_SHARD = "tensor_shard"
     MOE_WEIGHTS = "moe_weights"
     IMAGE_KV = "image_kv"
@@ -69,4 +71,3 @@ class Artifact:
     artifact_id: ArtifactId
     payload: bytes
     meta: ArtifactMeta = field(default_factory=ArtifactMeta)
-

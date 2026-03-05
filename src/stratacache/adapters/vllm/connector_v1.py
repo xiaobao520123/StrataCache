@@ -22,11 +22,13 @@ import atexit
 import signal
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from stratacache.backend.cpu_store import CpuMemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
 from stratacache.core.errors import ArtifactNotFound
+from stratacache.engine.storage_engine import StorageEngine
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
 
@@ -42,6 +44,11 @@ except Exception:  # noqa: BLE001
     KVConnectorMetadata = object  # type: ignore[assignment]
     KVConnectorRole = object  # type: ignore[assignment]
     torch = None  # type: ignore[assignment]
+
+try:  # optional dependency for config file parsing
+    import yaml  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    yaml = None  # type: ignore[assignment]
 
 
 _LAYER_RE = re.compile(r"(\d+)")
@@ -294,7 +301,7 @@ def _decode_bundle(payload: bytes) -> dict[int, bytes]:
     return out
 
 
-def _chain_key_from_extra(extra: dict[str, Any], vllm_config: Any) -> str:
+def _chain_key_from_config(cfg: dict[str, Any], vllm_config: Any) -> str:
     # Only include knobs that affect storage identity/shape.
     mc = getattr(vllm_config, "model_config", None)
     model_tag = getattr(mc, "served_model_name", None) or getattr(mc, "model", None) or "model"
@@ -306,11 +313,11 @@ def _chain_key_from_extra(extra: dict[str, Any], vllm_config: Any) -> str:
             "model": str(model_tag),
             "tp": tp,
             "rank": rank,
-            "use_cxl": str(extra.get("stratacache.use_cxl", os.getenv("STRATACACHE_USE_CXL", "0"))),
-            "writeback": str(extra.get("stratacache.writeback", os.getenv("STRATACACHE_WRITEBACK", "0"))),
-            "cpu_cap_mb": str(extra.get("stratacache.cpu_capacity_mb", os.getenv("STRATACACHE_CPU_CAP_MB", "512"))),
-            "cxl_dax": str(extra.get("stratacache.cxl_dax_device", os.getenv("STRATACACHE_CXL_DAX_DEVICE", "")) or ""),
-            "bundle_layers": str(extra.get("stratacache.bundle_layers", os.getenv("STRATACACHE_BUNDLE_LAYERS", "1"))),
+            "use_cxl": str(cfg.get("use_cxl", False)),
+            "writeback": str(cfg.get("writeback", False)),
+            "cpu_cap_mb": str(cfg.get("cpu_capacity_mb", 61440)),
+            "cxl_dax": str(cfg.get("cxl_dax_device", "") or ""),
+            "bundle_layers": str(cfg.get("bundle_layers", True)),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -375,6 +382,113 @@ def _parse_int(v: Any, default: int) -> int:
         return int(v)
     except Exception:  # noqa: BLE001
         return default
+
+
+_CONNECTOR_DEFAULTS: dict[str, Any] = {
+    "use_cxl": False,
+    "writeback": False,
+    "cpu_capacity_mb": 61440,
+    "chunk_size": 256,
+    "bundle_layers": True,
+    "tensor_codec": "stable",
+    "tensor_header_in_payload": False,
+    "log_stats": True,
+    "debug": False,
+    "save_partial_chunks": True,
+    "log_every": 50,
+    "log_min_interval_s": 2.0,
+    "cxl_dax_device": None,
+    "cxl_reset_metadata": False,
+}
+
+
+def _default_connector_config_path() -> Path:
+    p = Path(__file__).resolve()
+    candidates = [
+        p.parents[2] / "config.yaml",       # installed package layout
+        p.parents[4] / "config.yaml",       # source tree layout
+        Path.cwd() / "stratacache" / "config.yaml",
+        Path.cwd() / "config.yaml",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+def _read_yaml_config(path: Path, *, warn_missing_parser: bool) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    if yaml is None:
+        if warn_missing_parser:
+            logger.warning("config file exists but PyYAML is unavailable: %s", path)
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("failed to parse config file %s: %s", path, e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Accept either flat keys or nested:
+    # stratacache:
+    #   connector:
+    #     ...
+    node: dict[str, Any] = data
+    sc = node.get("stratacache")
+    if isinstance(sc, dict):
+        node = sc
+    conn = node.get("connector")
+    if isinstance(conn, dict):
+        node = conn
+    return node
+
+
+def _load_connector_config(extra: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(_CONNECTOR_DEFAULTS)
+
+    explicit_cfg_path = extra.get("stratacache.config_path") or extra.get("config_path")
+    cfg_path_raw = explicit_cfg_path or _default_connector_config_path()
+    cfg_path = Path(str(cfg_path_raw)).expanduser()
+    file_cfg = _read_yaml_config(cfg_path, warn_missing_parser=bool(explicit_cfg_path))
+
+    def pick(key: str) -> Any:
+        if f"stratacache.{key}" in extra:
+            return extra[f"stratacache.{key}"]
+        if key in extra:
+            return extra[key]
+        if key in file_cfg:
+            return file_cfg[key]
+        return cfg[key]
+
+    cfg["use_cxl"] = _parse_bool(pick("use_cxl"), bool(cfg["use_cxl"]))
+    cfg["writeback"] = _parse_bool(pick("writeback"), bool(cfg["writeback"]))
+    cfg["cpu_capacity_mb"] = _parse_int(pick("cpu_capacity_mb"), int(cfg["cpu_capacity_mb"]))
+    cfg["chunk_size"] = _parse_int(pick("chunk_size"), int(cfg["chunk_size"]))
+    cfg["bundle_layers"] = _parse_bool(pick("bundle_layers"), bool(cfg["bundle_layers"]))
+    cfg["tensor_codec"] = str(pick("tensor_codec") or cfg["tensor_codec"]).lower()
+    cfg["tensor_header_in_payload"] = _parse_bool(
+        pick("tensor_header_in_payload"),
+        bool(cfg["tensor_header_in_payload"]),
+    )
+    cfg["log_stats"] = _parse_bool(pick("log_stats"), bool(cfg["log_stats"]))
+    cfg["debug"] = _parse_bool(pick("debug"), bool(cfg["debug"]))
+    cfg["save_partial_chunks"] = _parse_bool(
+        pick("save_partial_chunks"),
+        bool(cfg["save_partial_chunks"]),
+    )
+    cfg["log_every"] = _parse_int(pick("log_every"), int(cfg["log_every"]))
+    try:
+        cfg["log_min_interval_s"] = float(pick("log_min_interval_s"))
+    except Exception:  # noqa: BLE001
+        cfg["log_min_interval_s"] = float(_CONNECTOR_DEFAULTS["log_min_interval_s"])
+    dax = pick("cxl_dax_device")
+    cfg["cxl_dax_device"] = None if dax in (None, "", "null") else str(dax)
+    cfg["cxl_reset_metadata"] = _parse_bool(
+        pick("cxl_reset_metadata"),
+        bool(cfg["cxl_reset_metadata"]),
+    )
+    return cfg
 
 
 def _as_token_list(x: Any) -> list[int]:
@@ -726,34 +840,23 @@ class _StrataConnectorImpl:
         _install_profile_signal_handlers()
 
         extra = getattr(vllm_config.kv_transfer_config, "kv_connector_extra_config", None) or {}
-        # Allow env overrides too.
-        use_cxl = _parse_bool(extra.get("stratacache.use_cxl", os.getenv("STRATACACHE_USE_CXL", "0")))
-        writeback = _parse_bool(extra.get("stratacache.writeback", os.getenv("STRATACACHE_WRITEBACK", "0")))
-        cpu_cap_mb = _parse_int(extra.get("stratacache.cpu_capacity_mb", os.getenv("STRATACACHE_CPU_CAP_MB", "512")), 512)
+        cfg = _load_connector_config(extra)
+        use_cxl = bool(cfg["use_cxl"])
+        writeback = bool(cfg["writeback"])
+        cpu_cap_mb = int(cfg["cpu_capacity_mb"])
         self._block_size = int(getattr(vllm_config.cache_config, "block_size", 16))
-        self._chunk_size = _parse_int(extra.get("stratacache.chunk_size", os.getenv("STRATACACHE_CHUNK_SIZE", "256")), 256)
-        self._bundle_layers = _parse_bool(extra.get("stratacache.bundle_layers", os.getenv("STRATACACHE_BUNDLE_LAYERS", "1")))
+        self._chunk_size = int(cfg["chunk_size"])
+        self._bundle_layers = bool(cfg["bundle_layers"])
 
-        self._tensor_codec = str(extra.get("stratacache.tensor_codec", os.getenv("STRATACACHE_TENSOR_CODEC", "stable"))).lower()
+        self._tensor_codec = str(cfg["tensor_codec"]).lower()
         # When disabled (default), stable codec stores raw tensor bytes and puts
         # dtype/shape in ArtifactMeta attrs, avoiding per-payload JSON header work.
-        self._tensor_header_in_payload = _parse_bool(
-            extra.get(
-                "stratacache.tensor_header_in_payload",
-                os.getenv("STRATACACHE_TENSOR_HEADER_IN_PAYLOAD", "0"),
-            ),
-            False,
-        )
-        self._log_stats = _parse_bool(extra.get("stratacache.log_stats", os.getenv("STRATACACHE_LOG_STATS", "1")), True)
-        self._debug = _parse_bool(extra.get("stratacache.debug", os.getenv("STRATACACHE_DEBUG", "0")), False)
-        self._save_partial_chunks = _parse_bool(
-            extra.get("stratacache.save_partial_chunks", os.getenv("STRATACACHE_SAVE_PARTIAL_CHUNKS", "1")),
-            True,
-        )
-        self._log_every = _parse_int(extra.get("stratacache.log_every", os.getenv("STRATACACHE_LOG_EVERY", "50")), 50)
-        self._log_min_interval_s = float(
-            extra.get("stratacache.log_min_interval_s", os.getenv("STRATACACHE_LOG_MIN_INTERVAL_S", "2.0"))
-        )
+        self._tensor_header_in_payload = bool(cfg["tensor_header_in_payload"])
+        self._log_stats = bool(cfg["log_stats"])
+        self._debug = bool(cfg["debug"])
+        self._save_partial_chunks = bool(cfg["save_partial_chunks"])
+        self._log_every = int(cfg["log_every"])
+        self._log_min_interval_s = float(cfg["log_min_interval_s"])
         self._stats = {
             # Scheduler-side token-level accounting.
             "sched_calls": 0,
@@ -780,8 +883,8 @@ class _StrataConnectorImpl:
         if use_cxl:
             from stratacache.backend.cxl.store import CxlConfig, CxlMemoryLayer
 
-            dax = extra.get("stratacache.cxl_dax_device", os.getenv("STRATACACHE_CXL_DAX_DEVICE"))
-            reset_md = _parse_bool(extra.get("stratacache.cxl_reset_metadata", os.getenv("STRATACACHE_CXL_RESET_METADATA", "0")))
+            dax = cfg.get("cxl_dax_device")
+            reset_md = bool(cfg["cxl_reset_metadata"])
             tiers.append(
                 CxlMemoryLayer(
                     config=CxlConfig(dax_device=dax, reset_metadata_on_init=reset_md),
@@ -793,11 +896,12 @@ class _StrataConnectorImpl:
         # vLLM may create multiple connector instances within the same process
         # (scheduler vs worker paths). Use a process-wide singleton TierChain so
         # in-process backends (CpuMemoryLayer) are shared and external matches can succeed.
-        self._chain_key = _chain_key_from_extra(extra, vllm_config)
+        self._chain_key = _chain_key_from_config(cfg, vllm_config)
         self._chain = _get_or_create_chain(key=self._chain_key, tiers=tiers, links=links)
+        self._engine = StorageEngine(self._chain)
 
         # Per-memory-layer IO attribution (by fetch hit tier and by write-through policy).
-        self._tier_names = [t.name for t in self._chain.tiers]
+        self._tier_names = list(self._engine.tier_names)
         self._io_by_tier = {
             name: {
                 "bytes_loaded": 0,
@@ -1008,19 +1112,19 @@ class _StrataConnectorImpl:
                 lid0 = self._chunk_bundle_tensor_id(pref, end)
             else:
                 lid0 = self._chunk_layer_id(pref, end, 0)
-            hit_tier = self._chain.exists(lid0)
+            hit_tier = self._engine.contains(lid0).hit_tier
             if hit_tier is None:
                 # Backward compat:
                 # - If bundle mode is on but cache was written in per-layer mode, try layer0.
                 # - As a last resort, fall back to manifest existence (may overestimate if payload evicted).
                 if self._bundle_layers:
                     # Try old bundle format.
-                    hit_tier = self._chain.exists(self._chunk_bundle_id(pref, end))
+                    hit_tier = self._engine.contains(self._chunk_bundle_id(pref, end)).hit_tier
                 if hit_tier is None and self._bundle_layers:
-                    hit_tier = self._chain.exists(self._chunk_layer_id(pref, end, 0))
+                    hit_tier = self._engine.contains(self._chunk_layer_id(pref, end, 0)).hit_tier
                 if hit_tier is None:
                     mid = self._chunk_manifest_id(pref, end)
-                    hit_tier = self._chain.exists(mid)
+                    hit_tier = self._engine.contains(mid).hit_tier
                     if hit_tier is None:
                         self._stats["manifest_misses"] += 1
                         st["next_idx"] = i
@@ -1452,7 +1556,7 @@ class _StrataConnectorImpl:
                     # Prefer new bundleT tensor format.
                     aid = self._chunk_bundle_tensor_id(pref, end)
                     try:
-                        fr = self._chain.fetch(aid, promote=False)
+                        fr = self._engine.load(aid, promote=False)
                         _prof_record("worker.start_load_kv.bundle.fetch", time.perf_counter() - t_fetch0)
                         t_dec0 = time.perf_counter()
                         stacked = self._decode_tensor(fr.payload, device=layer_items[0][1].device, meta=fr.meta)
@@ -1466,7 +1570,7 @@ class _StrataConnectorImpl:
                     # If bundleT missing, try old bundle format; then per-layer artifacts.
                     if fr is None or stacked is None:
                         try:
-                            fr = self._chain.fetch(self._chunk_bundle_id(pref, end), promote=False)
+                            fr = self._engine.load(self._chunk_bundle_id(pref, end), promote=False)
                             t_dec0 = time.perf_counter()
                             bundle = _decode_bundle(fr.payload)
                             _prof_record("worker.start_load_kv.bundle.decode_bundle", time.perf_counter() - t_dec0)
@@ -1502,7 +1606,7 @@ class _StrataConnectorImpl:
                         for layer_idx, kv_layer in layer_items:
                             laid = self._chunk_layer_id(pref, end, int(layer_idx))
                             try:
-                                lfr = self._chain.fetch(laid, promote=False)
+                                lfr = self._engine.load(laid, promote=False)
                             except ArtifactNotFound:
                                 break
                             gathered = self._decode_tensor(lfr.payload, device=kv_layer.device, meta=lfr.meta)
@@ -1512,7 +1616,7 @@ class _StrataConnectorImpl:
                                 break
                         # Attribute tokens as tier of layer0 if present; otherwise unknown -> skip.
                         try:
-                            l0 = self._chain.fetch(self._chunk_layer_id(pref, end, 0), promote=False)
+                            l0 = self._engine.load(self._chunk_layer_id(pref, end, 0), promote=False)
                             tier = self._tier_names[l0.hit_tier]
                             self._stats["loaded_chunks"] += 1
                             self._stats["bytes_loaded"] += len(l0.payload)
@@ -1562,7 +1666,7 @@ class _StrataConnectorImpl:
                                 break
                             aid = self._chunk_layer_id(pref, end, layer_idx)
                             try:
-                                fr = self._chain.fetch(aid, promote=False)
+                                fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
                             gathered = self._decode_tensor(fr.payload, device=kv_layer.device, meta=fr.meta)
@@ -1592,7 +1696,7 @@ class _StrataConnectorImpl:
                                 break
                             aid = self._chunk_layer_id(pref, end, layer_idx)
                             try:
-                                fr = self._chain.fetch(aid, promote=False)
+                                fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
                             gathered = self._decode_tensor(fr.payload, device=kv_layer.device, meta=fr.meta)
@@ -1730,7 +1834,7 @@ class _StrataConnectorImpl:
                 payload, tattrs = self._encode_tensor(gathered)
                 attrs = {"chunk_start": chunk_start, "chunk_end": end}
                 attrs.update(tattrs)
-                self._chain.store(
+                self._engine.store(
                     self._chunk_layer_id(pref, end, idx),
                     payload,
                     ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs),
@@ -1753,12 +1857,13 @@ class _StrataConnectorImpl:
                     else:
                         break
                 if idx == 0:
-                    self._chain.store(
+                    self._engine.store(
                         self._chunk_manifest_id(pref, end),
                         b"",
                         ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs={"tokens": end}),
                     )
-                    self._chain.flush(self._chunk_manifest_id(pref, end))
+                    # Internal write-back control: not part of StorageEngine public API.
+                    self._engine.chain.flush(self._chunk_manifest_id(pref, end))
                 chunk_start = end
             self._saved_upto_by_req_layer[layer_key] = max(prev_layer, max(chunk_ends))
 
@@ -1832,9 +1937,9 @@ class _StrataConnectorImpl:
             # Cross-request dedup: if this chunk is already cached, skip expensive
             # gather/encode/store and only advance watermark.
             if (
-                self._chain.exists(self._chunk_bundle_tensor_id(pref, int(end))) is not None
-                or self._chain.exists(self._chunk_bundle_id(pref, int(end))) is not None
-                or self._chain.exists(self._chunk_layer_id(pref, int(end), 0)) is not None
+                self._engine.contains(self._chunk_bundle_tensor_id(pref, int(end))).exists
+                or self._engine.contains(self._chunk_bundle_id(pref, int(end))).exists
+                or self._engine.contains(self._chunk_layer_id(pref, int(end), 0)).exists
             ):
                 bundle_key = (req_id, -1)
                 self._saved_upto_by_req_layer[bundle_key] = max(
@@ -1875,7 +1980,7 @@ class _StrataConnectorImpl:
                 "bundle_format": "tensor",
             }
             attrs.update(tattrs)
-            self._chain.store(
+            self._engine.store(
                 self._chunk_bundle_tensor_id(pref, int(end)),
                 payload,
                 ArtifactMeta(
@@ -1932,9 +2037,10 @@ class StrataCacheConnectorV1(KVConnectorBase_V1):  # type: ignore[misc]
     """
     vLLM KVConnector v1 for StrataCache.
 
-    Usage is typically via vLLM CLI:
-
-      --kv-transfer-config '{"kv_connector":"stratacache.adapters.vllm.connector_v1:StrataCacheConnectorV1", "kv_role":"kv_both", "kv_connector_extra_config":{...}}'
+    Example kv-transfer-config:
+      {"kv_connector":"StrataCacheConnectorV1",
+       "kv_connector_module_path":"stratacache.adapters.vllm.connector_v1",
+       "kv_role":"kv_both"}
     """
 
     def __init__(self, vllm_config: Any, role: Any, kv_cache_config: Any = None):
@@ -1976,4 +2082,3 @@ class StrataCacheConnectorV1(KVConnectorBase_V1):  # type: ignore[misc]
 
     def request_finished(self, request: Any, block_ids: list[int]) -> tuple[bool, Optional[dict[str, Any]]]:
         return self._impl.request_finished(request, block_ids)
-
