@@ -10,6 +10,9 @@ from stratacache.core.errors import ArtifactNotFound
 from stratacache.tiering.policy import LinkPolicy, StoreReason
 from stratacache.writeback.manager import WritebackManager
 
+from stratacache.telementry.telementry import StrataTelemetry, StrataSystemStats, StrataTierType
+
+import time
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
@@ -47,6 +50,7 @@ class TierChain:
             flush_hop=self._flush_hop,
             enable_worker=enable_writeback_worker,
         )
+        self._telementry = StrataTelemetry.GetOrCreate()
 
     @property
     def tiers(self) -> list[MemoryLayer]:
@@ -62,6 +66,13 @@ class TierChain:
 
     def close(self) -> None:
         self._wb.stop()
+        
+    def _resolve_tier_type(self, tier: int | str) -> StrataTierType:
+        if tier == 0 or tier == "cpu":
+            return StrataTierType.CPU
+        if tier == 1 or tier == "nixl":
+            return StrataTierType.NIXL
+        return StrataTierType.UNKNOWN
 
     def _resolve_tier_index(self, tier: int | str) -> int:
         if isinstance(tier, int):
@@ -104,7 +115,17 @@ class TierChain:
         with self._lock:
             for i, b in enumerate(self._tiers):
                 try:
+                    start_time = time.perf_counter()
+                    
                     payload, meta = b.get(artifact_id)
+                    
+                    end_time = time.perf_counter()
+                    self._telementry.on_tier_op_async(
+                        tier=self._resolve_tier_type(i),
+                        op_type="load",
+                        latency_us=(end_time - start_time) * 1_000_000,
+                        size=len(payload),
+                    )
                 except ArtifactNotFound:
                     continue
 
@@ -200,10 +221,19 @@ class TierChain:
         *,
         reason: StoreReason,
     ) -> None:
+        start_time = time.perf_counter()
+        
         # Direct backend write; does not apply chain semantics automatically.
         self._tiers[tier_index].put(artifact_id, payload, meta)
         # Promotions / flush writes should not mark dirty for upper tiers above them.
         _ = reason
+        
+        self._telementry.on_tier_op_async(
+            tier=self._resolve_tier_type(tier_index),
+            op_type="store",
+            latency_us=(time.perf_counter() - start_time) * 1_000_000,
+            size=len(payload),
+        )
 
     def _propagate_after_write(
         self,

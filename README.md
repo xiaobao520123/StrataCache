@@ -81,6 +81,7 @@ If no YAML file is found, built-in defaults are used.
 | `debug` | bool | `false` | Debug logging |
 | `cxl_dax_device` | str/null | `null` | CXL DAX device path |
 | `cxl_reset_metadata` | bool | `false` | Reset CXL metadata on init |
+| `wandb.enabled` | bool | `false` | Enable telementry export to wanDB |
 
 ## Design Overview
 

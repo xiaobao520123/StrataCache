@@ -11,6 +11,11 @@ stratacache:
     log_stats: true
     log_every: 50
     log_min_interval_s: 2.0
-    debug: false
+    debug: true
     cxl_dax_device: null
     cxl_reset_metadata: false
+    wandb:
+      enabled: true
+      entity: xiaobaomylike-microsoft
+      project: stratacache
+      run_name: default-run

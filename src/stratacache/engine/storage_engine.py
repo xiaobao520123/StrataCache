@@ -9,6 +9,7 @@ from stratacache.engine.types import AccessMode, ContainsResult, LoadResult
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
 
+import time
 
 class StorageEngine:
     """
@@ -103,7 +104,15 @@ class StorageEngine:
         m = _normalize_mode(mode)
 
         if medium is None or m == AccessMode.CHAIN:
+            perf_counter_start = time.perf_counter()
             fr = self._chain.fetch(artifact_id, promote=promote)
+            latency_ms = (time.perf_counter() - perf_counter_start) * 1000
+            self._telemetry.on_tier_ops_async(
+                device_type=StrataTierType.CPU,
+                op_type="load",
+                latency_ms=latency_ms,
+                size=len(fr.payload) if fr.payload is not None else 0,
+            )
             return LoadResult(
                 payload=fr.payload,
                 meta=fr.meta,
@@ -112,7 +121,15 @@ class StorageEngine:
             )
 
         if m == AccessMode.EXACT:
+            perf_counter_start = time.perf_counter()
             fr = self._chain.fetch_from(medium, artifact_id, promote=promote)
+            latency_ms = (time.perf_counter() - perf_counter_start) * 1000
+            self._telemetry.on_tier_ops_async(
+                device_type=StrataTierType.CPU,
+                op_type="load",
+                latency_ms=latency_ms,
+                size=len(fr.payload) if fr.payload is not None else 0,
+            )
             return LoadResult(
                 payload=fr.payload,
                 meta=fr.meta,
@@ -122,9 +139,19 @@ class StorageEngine:
 
         if m == AccessMode.PREFER:
             try:
+                perf_counter_start = time.perf_counter()
                 fr = self._chain.fetch_from(medium, artifact_id, promote=promote)
+                latency_ms = (time.perf_counter() - perf_counter_start) * 1000
             except (ArtifactNotFound, ValueError):
+                perf_counter_start = time.perf_counter()
                 fr = self._chain.fetch(artifact_id, promote=promote)
+                latency_ms = (time.perf_counter() - perf_counter_start) * 1000
+            self._telemetry.on_tier_ops_async(
+                device_type=StrataTierType.CPU,
+                op_type="load",
+                latency_ms=latency_ms,
+                size=len(fr.payload) if fr.payload is not None else 0,
+            )
             return LoadResult(
                 payload=fr.payload,
                 meta=fr.meta,
