@@ -878,7 +878,10 @@ class _StrataConnectorImpl:
         self._last_logged_io_total = -1
         self._last_logged_sched_calls = -1
 
-        tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_mb * 1024 * 1024, store_name="cpu")]
+        # tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_mb * 1024 * 1024, store_name="cpu")]
+        tiers = []
+        from stratacache.backend.disk.store import DiskMemoryLayer
+        tiers.append(DiskMemoryLayer(store_name="disk"))
         links: list[LinkPolicy] = []
         if use_cxl:
             from stratacache.backend.cxl.store import CxlConfig, CxlMemoryLayer
@@ -892,6 +895,8 @@ class _StrataConnectorImpl:
                 )
             )
             links.append(LinkPolicy.WRITE_BACK if writeback else LinkPolicy.WRITE_THROUGH)
+        
+        # TODO: NIXL here
 
         # vLLM may create multiple connector instances within the same process
         # (scheduler vs worker paths). Use a process-wide singleton TierChain so

@@ -18,6 +18,8 @@ src/stratacache/backend/cpu_store.py
 src/stratacache/backend/cxl/__init__.py
 src/stratacache/backend/cxl/binding.py
 src/stratacache/backend/cxl/store.py
+src/stratacache/backend/disk/__init__.py
+src/stratacache/backend/disk/store.py
 src/stratacache/core/__init__.py
 src/stratacache/core/artifact.py
 src/stratacache/core/errors.py
