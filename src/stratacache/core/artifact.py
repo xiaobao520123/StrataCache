@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
+from .lsm_key import LSMBlockKey
 
 
 class ArtifactType(str, Enum):
@@ -25,6 +26,11 @@ class ArtifactId:
     """
 
     value: str
+    lsm_key: LSMBlockKey | None = None # Shadow key for LSM block.
+    
+    def __init__(self, value: str, lsm_key: LSMBlockKey | None = None):
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "lsm_key", lsm_key)
 
     def __str__(self) -> str:
         return self.value

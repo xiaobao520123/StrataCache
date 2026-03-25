@@ -8,6 +8,7 @@ Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: PyYAML>=6.0
 Requires-Dist: vllm==0.13.0
+Requires-Dist: sortedcontainers>=2.0.0
 
 # StrataCache
 

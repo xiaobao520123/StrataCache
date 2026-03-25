@@ -31,6 +31,7 @@ from stratacache.core.errors import ArtifactNotFound
 from stratacache.engine.storage_engine import StorageEngine
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
+from stratacache.core.lsm_key import LSMBlockKey, build_full_token_block_key
 
 try:  # optional dependency
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # type: ignore[import-not-found]
@@ -1002,19 +1003,19 @@ class _StrataConnectorImpl:
         rank = getattr(pc, "rank", None)
         return f"vllm013:{self._model_tag()}:tp={tp}:rank={rank}:h={prompt_hash}"
 
-    def _chunk_manifest_id(self, prefix_hash: str, chunk_end: int) -> ArtifactId:
+    def _chunk_manifest_id(self, prefix_hash: str, chunk_end: int, lsm_key: LSMBlockKey = None) -> ArtifactId:
         # prefix_hash already identifies the prefix tokens; chunk_end is stored for sanity/debug.
-        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:manifest")
+        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:manifest", lsm_key=lsm_key)
 
-    def _chunk_bundle_id(self, prefix_hash: str, chunk_end: int) -> ArtifactId:
-        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:bundle")
+    def _chunk_bundle_id(self, prefix_hash: str, chunk_end: int, lsm_key: LSMBlockKey = None) -> ArtifactId:
+        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:bundle", lsm_key=lsm_key)
 
-    def _chunk_bundle_tensor_id(self, prefix_hash: str, chunk_end: int) -> ArtifactId:
+    def _chunk_bundle_tensor_id(self, prefix_hash: str, chunk_end: int, lsm_key: LSMBlockKey = None) -> ArtifactId:
         # New (faster) format: one tensor containing all layers for this chunk_end.
-        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:bundleT")
+        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:bundleT", lsm_key=lsm_key)
 
-    def _chunk_layer_id(self, prefix_hash: str, chunk_end: int, layer_idx: int) -> ArtifactId:
-        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:layer={layer_idx}")
+    def _chunk_layer_id(self, prefix_hash: str, chunk_end: int, layer_idx: int, lsm_key: LSMBlockKey = None) -> ArtifactId:
+        return ArtifactId(f"vllm013:{self._model_tag()}:chunk_end={chunk_end}:ph={prefix_hash}:layer={layer_idx}", lsm_key=lsm_key)
 
     def _encode_tensor(self, t: "torch.Tensor") -> tuple[bytes, dict[str, Any]]:
         if self._tensor_codec == "torchsave":
@@ -1086,6 +1087,7 @@ class _StrataConnectorImpl:
             or list(st.get("boundaries", [])) != boundaries
         ):
             ph_map = _prefix_hashes(token_ids, boundaries)
+            lsm_key_map = build_full_token_block_key(token_ids, boundaries, block_size=int(self._block_size))
             st = {
                 "sig": sig,
                 "chunk_size": int(cs),
@@ -1099,7 +1101,9 @@ class _StrataConnectorImpl:
                 self._match_state_by_req[rid_str] = st
         else:
             ph_map = dict(st.get("ph_map", {}) or {})
+            lsm_key_map = dict(st.get("lsm_key_map", {}) or {})        
 
+    
         cached_tokens = int(st.get("hit_end", 0))
         # Track which tier each chunk boundary hits in (for per-backend accounting).
         segs: list[tuple[str, int, int]] = list(st.get("hit_segs", []) or [])  # (tier_name, start, end)
@@ -1108,15 +1112,16 @@ class _StrataConnectorImpl:
         for i in range(start_idx, len(boundaries)):
             end = int(boundaries[i])
             pref = ph_map.get(end)
+            lsm_key = lsm_key_map.get(end)
             if pref is None:
                 break
             # Prefer checking actual layer0 payload existence to avoid relying
             # on small manifest markers that may be evicted under LRU pressure.
             if self._bundle_layers:
                 # Prefer newest bundle format first.
-                lid0 = self._chunk_bundle_tensor_id(pref, end)
+                lid0 = self._chunk_bundle_tensor_id(pref, end, lsm_key=lsm_key)
             else:
-                lid0 = self._chunk_layer_id(pref, end, 0)
+                lid0 = self._chunk_layer_id(pref, end, 0, lsm_key=lsm_key)
             hit_tier = self._engine.contains(lid0).hit_tier
             if hit_tier is None:
                 # Backward compat:
@@ -1124,11 +1129,11 @@ class _StrataConnectorImpl:
                 # - As a last resort, fall back to manifest existence (may overestimate if payload evicted).
                 if self._bundle_layers:
                     # Try old bundle format.
-                    hit_tier = self._engine.contains(self._chunk_bundle_id(pref, end)).hit_tier
+                    hit_tier = self._engine.contains(self._chunk_bundle_id(pref, end, lsm_key=lsm_key)).hit_tier
                 if hit_tier is None and self._bundle_layers:
-                    hit_tier = self._engine.contains(self._chunk_layer_id(pref, end, 0)).hit_tier
+                    hit_tier = self._engine.contains(self._chunk_layer_id(pref, end, 0, lsm_key=lsm_key)).hit_tier
                 if hit_tier is None:
-                    mid = self._chunk_manifest_id(pref, end)
+                    mid = self._chunk_manifest_id(pref, end, lsm_key=lsm_key)
                     hit_tier = self._engine.contains(mid).hit_tier
                     if hit_tier is None:
                         self._stats["manifest_misses"] += 1
@@ -1536,6 +1541,7 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
 
             # We'll count "actual loaded tokens" best-effort based on layer0 progress.
             loaded_tokens_for_req = 0
@@ -1553,13 +1559,14 @@ class _StrataConnectorImpl:
                 for end in chunk_ends:
                     t_fetch0 = time.perf_counter()
                     pref = ph_map.get(end)
+                    lsm_key = lsm_key_map.get(end)
                     if pref is None:
                         break
                     sm_slice = req.slot_mapping[chunk_start:end]
                     if int(sm_slice.numel()) != int(end - chunk_start):
                         break
                     # Prefer new bundleT tensor format.
-                    aid = self._chunk_bundle_tensor_id(pref, end)
+                    aid = self._chunk_bundle_tensor_id(pref, end, lsm_key=lsm_key)
                     try:
                         fr = self._engine.load(aid, promote=False)
                         _prof_record("worker.start_load_kv.bundle.fetch", time.perf_counter() - t_fetch0)
@@ -1575,7 +1582,7 @@ class _StrataConnectorImpl:
                     # If bundleT missing, try old bundle format; then per-layer artifacts.
                     if fr is None or stacked is None:
                         try:
-                            fr = self._engine.load(self._chunk_bundle_id(pref, end), promote=False)
+                            fr = self._engine.load(self._chunk_bundle_id(pref, end, lsm_key=lsm_key), promote=False)
                             t_dec0 = time.perf_counter()
                             bundle = _decode_bundle(fr.payload)
                             _prof_record("worker.start_load_kv.bundle.decode_bundle", time.perf_counter() - t_dec0)
@@ -1609,7 +1616,7 @@ class _StrataConnectorImpl:
 
                     if fr is None or stacked is None:
                         for layer_idx, kv_layer in layer_items:
-                            laid = self._chunk_layer_id(pref, end, int(layer_idx))
+                            laid = self._chunk_layer_id(pref, end, int(layer_idx), lsm_key=lsm_key)
                             try:
                                 lfr = self._engine.load(laid, promote=False)
                             except ArtifactNotFound:
@@ -1621,7 +1628,7 @@ class _StrataConnectorImpl:
                                 break
                         # Attribute tokens as tier of layer0 if present; otherwise unknown -> skip.
                         try:
-                            l0 = self._engine.load(self._chunk_layer_id(pref, end, 0), promote=False)
+                            l0 = self._engine.load(self._chunk_layer_id(pref, end, 0, lsm_key=lsm_key), promote=False)
                             tier = self._tier_names[l0.hit_tier]
                             self._stats["loaded_chunks"] += 1
                             self._stats["bytes_loaded"] += len(l0.payload)
@@ -1669,7 +1676,7 @@ class _StrataConnectorImpl:
                             sm_slice = req.slot_mapping[chunk_start:end]
                             if int(sm_slice.numel()) != int(end - chunk_start):
                                 break
-                            aid = self._chunk_layer_id(pref, end, layer_idx)
+                            aid = self._chunk_layer_id(pref, end, layer_idx, lsm_key=lsm_key)
                             try:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
@@ -1699,7 +1706,7 @@ class _StrataConnectorImpl:
                             sm_slice = req.slot_mapping[chunk_start:end]
                             if int(sm_slice.numel()) != int(end - chunk_start):
                                 break
-                            aid = self._chunk_layer_id(pref, end, layer_idx)
+                            aid = self._chunk_layer_id(pref, end, layer_idx, lsm_key=lsm_key)
                             try:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
@@ -1782,9 +1789,11 @@ class _StrataConnectorImpl:
                         continue
                     self._pending_ends_by_req[str(req.req_id)] = list(int(e) for e in chunk_ends)
                     ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+                    lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
                     chunk_start = int(prev_bundle)
                     for end in chunk_ends:
                         pref = ph_map.get(end)
+                        lsm_key = lsm_key_map.get(end)
                         if pref is None:
                             break
                         pkey = (req.req_id, int(end))
@@ -1792,6 +1801,7 @@ class _StrataConnectorImpl:
                         if ent is None:
                             ent = {
                                 "pref": pref,
+                                "lsm_key": lsm_key,
                                 "end": int(end),
                                 "chunk_start": int(chunk_start),
                                 "slot_mapping": req.slot_mapping[chunk_start:end],
@@ -1830,9 +1840,11 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
             chunk_start = prev_layer
             for end in chunk_ends:
                 pref = ph_map.get(end)
+                lsm_key = lsm_key_map.get(end)
                 if pref is None:
                     break
                 gathered = _gather_by_slots(kv_layer, req.slot_mapping[chunk_start:end]).detach()
@@ -1840,7 +1852,7 @@ class _StrataConnectorImpl:
                 attrs = {"chunk_start": chunk_start, "chunk_end": end}
                 attrs.update(tattrs)
                 self._engine.store(
-                    self._chunk_layer_id(pref, end, idx),
+                    self._chunk_layer_id(pref, end, idx, lsm_key=lsm_key),
                     payload,
                     ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs),
                 )
@@ -1863,12 +1875,12 @@ class _StrataConnectorImpl:
                         break
                 if idx == 0:
                     self._engine.store(
-                        self._chunk_manifest_id(pref, end),
+                        self._chunk_manifest_id(pref, end, lsm_key=lsm_key),
                         b"",
                         ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs={"tokens": end}),
                     )
                     # Internal write-back control: not part of StorageEngine public API.
-                    self._engine.chain.flush(self._chunk_manifest_id(pref, end))
+                    self._engine.chain.flush(self._chunk_manifest_id(pref, end, lsm_key=lsm_key))
                 chunk_start = end
             self._saved_upto_by_req_layer[layer_key] = max(prev_layer, max(chunk_ends))
 
@@ -1934,6 +1946,7 @@ class _StrataConnectorImpl:
                 continue
             req_id, end = pkey
             pref = str(ent.get("pref", ""))
+            lsm_key = LSMBlockKey(ent.get("lsm_key", None))
             chunk_start = int(ent.get("chunk_start", 0))
             sm_slice = ent.get("slot_mapping")
             if sm_slice is None:
@@ -1942,9 +1955,9 @@ class _StrataConnectorImpl:
             # Cross-request dedup: if this chunk is already cached, skip expensive
             # gather/encode/store and only advance watermark.
             if (
-                self._engine.contains(self._chunk_bundle_tensor_id(pref, int(end))).exists
-                or self._engine.contains(self._chunk_bundle_id(pref, int(end))).exists
-                or self._engine.contains(self._chunk_layer_id(pref, int(end), 0)).exists
+                self._engine.contains(self._chunk_bundle_tensor_id(pref, int(end), lsm_key=lsm_key)).exists
+                or self._engine.contains(self._chunk_bundle_id(pref, int(end), lsm_key=lsm_key)).exists
+                or self._engine.contains(self._chunk_layer_id(pref, int(end), 0, lsm_key=lsm_key)).exists
             ):
                 bundle_key = (req_id, -1)
                 self._saved_upto_by_req_layer[bundle_key] = max(
@@ -1986,7 +1999,7 @@ class _StrataConnectorImpl:
             }
             attrs.update(tattrs)
             self._engine.store(
-                self._chunk_bundle_tensor_id(pref, int(end)),
+                self._chunk_bundle_tensor_id(pref, int(end), lsm_key=lsm_key),
                 payload,
                 ArtifactMeta(
                     artifact_type=ArtifactType.KV_BLOCKS,
