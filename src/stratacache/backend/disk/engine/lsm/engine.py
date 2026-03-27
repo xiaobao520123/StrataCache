@@ -11,11 +11,11 @@ import logging
 from struct import pack, unpack
 
 import mmap
-from hashlib import sha256
 
 logger = logging.getLogger(__name__)
 
 MAGIC = b"SLSM"  # Magic header for LSM files
+from hashlib import sha256
 
 @dataclass
 class LSMBlockValue:
@@ -89,10 +89,10 @@ class LSMEngine(DiskBackendEngine):
     
     def get(self, artifact_id: ArtifactId) -> Tuple[bytes, ArtifactMeta]:
         """Retrieve an artifact and its metadata from storage."""
-        
+        logger.info(f"Getting artifact {artifact_id} from LSM.")
         lsm_key = artifact_id.lsm_key
         self.ensure_lsm_key(artifact_id)
-        logger.info(f"Getting {lsm_key.hex()} from LSM.")
+        logger.info(f"Looking up LSM key {lsm_key.hex()} in memtable.")
 
         value = self._memtable.get(lsm_key, self._default)
         if value is self._default:
@@ -114,8 +114,8 @@ class LSMEngine(DiskBackendEngine):
                         raise ValueError(f"Invalid magic header at offset {offset}: expected {MAGIC}, got {magic}")
                     lsm_key_hash = m[4:36]
                     if lsm_key_hash != sha256(lsm_key).digest():
-                        logger.error(f"LSM key hash mismatch at offset {offset}: expected {sha256(lsm_key).digest()}, got {lsm_key_hash}")
-                        raise ValueError(f"LSM key hash mismatch at offset {offset}: expected {sha256(lsm_key).digest()}, got {lsm_key_hash}")
+                        logger.error(f"LSM key hash mismatch at offset {offset}: expected {sha256(lsm_key).hexdigest()}, got {lsm_key_hash.hex()}")
+                        raise ValueError(f"LSM key hash mismatch at offset {offset}: expected {sha256(lsm_key).hexdigest()}, got {lsm_key_hash.hex()}")
                     payload_size = unpack("I", m[36:40])[0]
                     logger.info(f"Read size {payload_size} for chunk at offset {offset}.")
                     payload = bytes(m[40:40+payload_size])
@@ -129,6 +129,7 @@ class LSMEngine(DiskBackendEngine):
     def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> None:
         """Store an artifact and its metadata."""
 
+        logger.info(f"Putting artifact {artifact_id} into LSM.")
         lsm_key = artifact_id.lsm_key
         self.ensure_lsm_key(artifact_id)
         logger.info(f"Putting {lsm_key.hex()} into LSM.")

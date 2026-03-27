@@ -9,6 +9,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: PyYAML>=6.0
 Requires-Dist: vllm==0.13.0
 Requires-Dist: sortedcontainers>=2.0.0
+Requires-Dist: kvikio-cu12>=26.2.0
 
 # StrataCache
 

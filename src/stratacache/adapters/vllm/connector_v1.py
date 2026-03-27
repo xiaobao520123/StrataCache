@@ -20,6 +20,7 @@ import struct
 import logging
 import atexit
 import signal
+
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1087,7 +1088,8 @@ class _StrataConnectorImpl:
             or list(st.get("boundaries", [])) != boundaries
         ):
             ph_map = _prefix_hashes(token_ids, boundaries)
-            lsm_key_map = build_full_token_block_key(token_ids, boundaries, block_size=int(self._block_size))
+            logger.info(f"boundaries={boundaries}")
+            lsm_key_map = build_full_token_block_key(token_ids, boundaries, block_size=int(self._chunk_size))
             st = {
                 "sig": sig,
                 "chunk_size": int(cs),
@@ -1266,7 +1268,10 @@ class _StrataConnectorImpl:
                 # vLLM passes `num_external_tokens_to_load` as "additional tokens
                 # to load beyond `num_computed_tokens_before_step`". Convert to a
                 # total cached prefix length so the worker can skip what vLLM already has.
-                vllm_cached = min(len(prompt_token_ids), max(0, int(num_computed_tokens_before_step)))
+                # num_computed_tokens_before_step already includes external tokens
+                # (vLLM bumps num_computed_tokens after update_state_after_alloc).
+                # Subtract ext to avoid double-counting the external range.
+                vllm_cached = min(len(prompt_token_ids), max(0, int(num_computed_tokens_before_step) - int(num_external_tokens_to_load)))
                 cached_total = vllm_cached + max(0, int(num_external_tokens_to_load))
                 cached_total = min(int(cached_total), len(prompt_token_ids))
                 load_ends = list(range(cs, (cached_total // cs) * cs + 1, cs))
@@ -1541,7 +1546,8 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
+            logger.info(f"boundaries={chunk_ends}")
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
 
             # We'll count "actual loaded tokens" best-effort based on layer0 progress.
             loaded_tokens_for_req = 0
@@ -1789,7 +1795,8 @@ class _StrataConnectorImpl:
                         continue
                     self._pending_ends_by_req[str(req.req_id)] = list(int(e) for e in chunk_ends)
                     ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-                    lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
+                    logger.info(f"boundaries={chunk_ends}")
+                    lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
                     chunk_start = int(prev_bundle)
                     for end in chunk_ends:
                         pref = ph_map.get(end)
@@ -1840,7 +1847,8 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._block_size))
+            logger.info(f"boundaries={chunk_ends}")
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
             chunk_start = prev_layer
             for end in chunk_ends:
                 pref = ph_map.get(end)
@@ -1946,7 +1954,7 @@ class _StrataConnectorImpl:
                 continue
             req_id, end = pkey
             pref = str(ent.get("pref", ""))
-            lsm_key = LSMBlockKey(ent.get("lsm_key", None))
+            lsm_key = ent.get("lsm_key", [])
             chunk_start = int(ent.get("chunk_start", 0))
             sm_slice = ent.get("slot_mapping")
             if sm_slice is None:
