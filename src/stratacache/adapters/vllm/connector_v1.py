@@ -880,10 +880,10 @@ class _StrataConnectorImpl:
         self._last_logged_io_total = -1
         self._last_logged_sched_calls = -1
 
-        # tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_mb * 1024 * 1024, store_name="cpu")]
-        tiers = []
+        tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_mb * 1024 * 1024, store_name="cpu")]
+        # tiers = []
         from stratacache.backend.disk.store import DiskMemoryLayer
-        tiers.append(DiskMemoryLayer(store_name="disk"))
+        # tiers.append(DiskMemoryLayer(store_name="disk"))
         links: list[LinkPolicy] = []
         if use_cxl:
             from stratacache.backend.cxl.store import CxlConfig, CxlMemoryLayer
@@ -1088,8 +1088,7 @@ class _StrataConnectorImpl:
             or list(st.get("boundaries", [])) != boundaries
         ):
             ph_map = _prefix_hashes(token_ids, boundaries)
-            logger.info(f"boundaries={boundaries}")
-            lsm_key_map = build_full_token_block_key(token_ids, boundaries, block_size=int(self._chunk_size))
+            lsm_key_map = build_full_token_block_key(token_ids, boundaries)
             st = {
                 "sig": sig,
                 "chunk_size": int(cs),
@@ -1546,8 +1545,7 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-            logger.info(f"boundaries={chunk_ends}")
-            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends)
 
             # We'll count "actual loaded tokens" best-effort based on layer0 progress.
             loaded_tokens_for_req = 0
@@ -1795,8 +1793,7 @@ class _StrataConnectorImpl:
                         continue
                     self._pending_ends_by_req[str(req.req_id)] = list(int(e) for e in chunk_ends)
                     ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-                    logger.info(f"boundaries={chunk_ends}")
-                    lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
+                    lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends)
                     chunk_start = int(prev_bundle)
                     for end in chunk_ends:
                         pref = ph_map.get(end)
@@ -1847,8 +1844,7 @@ class _StrataConnectorImpl:
             if not chunk_ends:
                 continue
             ph_map = _prefix_hashes(req.token_ids, chunk_ends)
-            logger.info(f"boundaries={chunk_ends}")
-            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends, block_size=int(self._chunk_size))
+            lsm_key_map = build_full_token_block_key(req.token_ids, chunk_ends)
             chunk_start = prev_layer
             for end in chunk_ends:
                 pref = ph_map.get(end)
