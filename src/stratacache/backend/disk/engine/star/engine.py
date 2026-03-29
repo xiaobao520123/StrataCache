@@ -1,6 +1,7 @@
 from stratacache.backend.disk.engine.base import DiskBackendEngine
 from stratacache.backend.base import BackendStats
 from stratacache.core.artifact import ArtifactId, ArtifactMeta
+from 
 
 import json
 import threading
@@ -10,9 +11,9 @@ from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-class FileEngine(DiskBackendEngine):
+class StarEngine(DiskBackendEngine):
     def __init__(self, *, store_dir: str):
-        self._name = "file"
+        self._name = "star"
         self._store_dir = Path(store_dir)
         self._lock = threading.RLock()
         self._bytes_used = 0
@@ -20,6 +21,8 @@ class FileEngine(DiskBackendEngine):
         
         # Create storage directory if it doesn't exist
         self._store_dir.mkdir(parents=True, exist_ok=True)
+        
+        
     
     @property
     def name(self) -> str:
@@ -88,7 +91,7 @@ class FileEngine(DiskBackendEngine):
             meta_path = self._get_meta_path(artifact_id)
             
             if not artifact_path.exists():
-                raise FileNotFoundError(f"Artifact {artifact_id} not found")
+                raise ArtifactNotFound(f"Artifact {artifact_id} not found")
             
             # Update bytes count
             self._bytes_used -= artifact_path.stat().st_size
@@ -110,8 +113,8 @@ class FileEngine(DiskBackendEngine):
     
     def _get_artifact_path(self, artifact_id: ArtifactId) -> Path:
         """Get the file path for an artifact's payload."""
-        return self._store_dir / f"{artifact_id.value.replace('/', '-')}.bin"
+        return self._store_dir / f"{artifact_id.value}.bin"
     
     def _get_meta_path(self, artifact_id: ArtifactId) -> Path:
         """Get the file path for an artifact's metadata."""
-        return self._store_dir / f"{artifact_id.value.replace('/', '-')}.meta.json"
+        return self._store_dir / f"{artifact_id.value}.meta.json"

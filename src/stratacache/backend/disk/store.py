@@ -2,7 +2,6 @@ from stratacache.backend.base import MemoryLayer, BackendStats
 from stratacache.core.artifact import ArtifactId, ArtifactMeta
 from stratacache.backend.disk.engine.base import DiskBackendEngine
 from stratacache.backend.disk.engine.file.engine import FileEngine
-from stratacache.backend.disk.engine.lsm.engine import LSMEngine
 
 import logging
 from pathlib import Path
@@ -16,7 +15,7 @@ class DiskMemoryLayer(MemoryLayer):
         *,
         store_name: str = "disk",
         store_dir: str = "./disk_store",
-        engine: str = "lsm",
+        engine: str = "file",
     ):
         self._name = store_name
         self._store_dir = Path(store_dir)
@@ -31,8 +30,6 @@ class DiskMemoryLayer(MemoryLayer):
         """Initialize the appropriate disk backend engine based on the configuration."""
         if engine_name == "file":
             return FileEngine(store_dir=store_dir)
-        elif engine_name == "lsm":
-            return LSMEngine(store_dir=store_dir)
         else:
             raise ValueError(f"Unsupported disk backend engine: {engine_name}")
 

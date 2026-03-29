@@ -24,10 +24,8 @@ src/stratacache/backend/disk/engine/__init__.py
 src/stratacache/backend/disk/engine/base.py
 src/stratacache/backend/disk/engine/file/__init__.py
 src/stratacache/backend/disk/engine/file/engine.py
-src/stratacache/backend/disk/engine/lsm/__init__.py
-src/stratacache/backend/disk/engine/lsm/engine.py
-src/stratacache/backend/disk/engine/lsm/index.py
-src/stratacache/backend/disk/engine/lsm/memtable.py
+src/stratacache/backend/disk/engine/star/__init__.py
+src/stratacache/backend/disk/engine/star/engine.py
 src/stratacache/core/__init__.py
 src/stratacache/core/artifact.py
 src/stratacache/core/errors.py
