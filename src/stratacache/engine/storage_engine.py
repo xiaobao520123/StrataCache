@@ -9,6 +9,42 @@ from stratacache.engine.types import AccessMode, ContainsResult, LoadResult
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
 
+import math
+import time
+
+import threading
+
+score_lock = threading.Lock()
+scores: dict[ArtifactId, CacheBlock] = {}
+
+
+class CacheBlock:
+
+    def __init__(
+        self,
+        artifact_id: ArtifactId,
+        chunk_end: int,
+        hit: int = 0,
+        last_tick: float = time.time(),
+    ) -> None:
+        self.artifact_id = artifact_id
+        self.chunk_end = chunk_end
+        assert chunk_end > 0, "chunk_end must be positive"
+        self.hit = hit
+        self.last_tick = last_tick
+
+    @property
+    def score(self) -> float:
+        return self.base_score
+
+    @property
+    def base_score(self) -> float:
+        return self.hit
+
+    @property
+    def recency(self) -> float:
+        return math.exp(-0.3 * (time.time() - self.last_tick))
+
 
 class StorageEngine:
     """
@@ -66,6 +102,16 @@ class StorageEngine:
         - `mode=exact` with `medium`: write only to that tier.
         - `mode=chain` with `medium`: write at that tier and propagate downstream.
         """
+
+        # chunk_end is in ArtifactId
+        with score_lock:
+            if scores.get(artifact_id) is None:
+                scores[artifact_id] = CacheBlock(
+                    artifact_id,
+                    chunk_end=artifact_id.chunk_end,
+                    hit=0,
+                    last_tick=time.time(),
+                )
         m = _normalize_mode(mode)
         if medium is None:
             self._chain.store(artifact_id, payload, meta)
@@ -79,7 +125,9 @@ class StorageEngine:
             return
         if m == AccessMode.PREFER:
             try:
-                self._chain.store_at(medium, artifact_id, payload, meta, propagate=False)
+                self._chain.store_at(
+                    medium, artifact_id, payload, meta, propagate=False
+                )
             except ValueError:
                 self._chain.store(artifact_id, payload, meta)
             return
@@ -100,6 +148,11 @@ class StorageEngine:
         - `exact`: only read from `medium`.
         - `prefer`: try `medium`, fallback to chain lookup.
         """
+        with score_lock:
+            if scores.get(artifact_id) is not None:
+                scores[artifact_id].hit += 1
+                scores[artifact_id].last_tick = time.time()
+
         m = _normalize_mode(mode)
 
         if medium is None or m == AccessMode.CHAIN:
@@ -162,7 +215,9 @@ class StorageEngine:
             if not ok:
                 return ContainsResult(exists=False, hit_tier=None, hit_medium=None)
             idx = _resolve_tier(self._chain, medium)
-            return ContainsResult(exists=True, hit_tier=idx, hit_medium=self._chain.tier_names[idx])
+            return ContainsResult(
+                exists=True, hit_tier=idx, hit_medium=self._chain.tier_names[idx]
+            )
 
         if m == AccessMode.PREFER:
             try:
@@ -179,11 +234,15 @@ class StorageEngine:
             hit = self._chain.exists(artifact_id)
             if hit is None:
                 return ContainsResult(exists=False, hit_tier=None, hit_medium=None)
-            return ContainsResult(exists=True, hit_tier=hit, hit_medium=self._chain.tier_names[hit])
+            return ContainsResult(
+                exists=True, hit_tier=hit, hit_medium=self._chain.tier_names[hit]
+            )
 
         raise ValueError(f"unknown mode: {mode}")
 
-    def delete(self, artifact_id: ArtifactId, *, medium: int | str | None = None) -> None:
+    def delete(
+        self, artifact_id: ArtifactId, *, medium: int | str | None = None
+    ) -> None:
         """Delete from one tier (`medium`) or all tiers (`medium=None`)."""
         if medium is None:
             self._chain.delete(artifact_id)
@@ -211,3 +270,15 @@ def _resolve_tier(chain: TierChain, tier: int | str) -> int:
         if t.name == name:
             return i
     raise ValueError(f"unknown tier: {tier}")
+
+
+def dump_cache_scores() -> list:
+    with score_lock:
+        out = [
+            {
+                "artifact_id": str(aid),
+                "score": cb.score,
+            }
+            for aid, cb in scores.items()
+        ]
+        return out

@@ -28,6 +28,10 @@ class ArtifactId:
 
     def __str__(self) -> str:
         return self.value
+    
+    @property
+    def chunk_end(self) -> int:
+        return int(self.value.split(":")[2].replace("chunk_end=", ""))
 
 
 JsonDict = dict[str, Any]
